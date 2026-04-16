@@ -1,0 +1,1128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Guitar Tab Keeper</title>
+
+  <!-- Tailwind CDN v3 -->
+  <script src="https://cdn.tailwindcss.com"></script>
+
+  <style>
+    :root {
+      --bg-primary:   #0f0f0f;
+      --bg-secondary: #1a1a1a;
+      --bg-card:      #222222;
+      --border:       #333333;
+      --accent:       #c9a84c;
+      --text-primary: #e8e0d0;
+      --text-muted:   #888880;
+    }
+
+    html, body, #root { height: 100%; }
+
+    body {
+      background-color: var(--bg-primary);
+      color: var(--text-primary);
+      font-family: system-ui, -apple-system, sans-serif;
+      overflow: hidden;
+    }
+
+    /* Custom scrollbar */
+    ::-webkit-scrollbar       { width: 6px; }
+    ::-webkit-scrollbar-track { background: var(--bg-secondary); }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+
+    /* Monospace for tabs / lyrics */
+    .tab-text {
+      font-family: "Courier New", Courier, monospace;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!-- React 18 UMD -->
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+
+  <!--
+    Lucide UMD — each icon is exported as IconNode[]:
+      [ [tagName, {attrs}], … ]
+    We wrap them in a tiny React adapter below.
+  -->
+  <script src="https://unpkg.com/lucide@0.511.0/dist/umd/lucide.min.js"></script>
+
+  <!-- Babel standalone for in-browser JSX (cached by browser after first load) -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <script type="text/babel" data-presets="react">
+    const { useState, useEffect, useCallback, useMemo, useRef } = React;
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Lucide icon adapter
+    // ─────────────────────────────────────────────────────────────────────────
+    function createIcon(name) {
+      return function Icon({ size = 24, className, style }) {
+        const data = window.lucide && window.lucide[name];
+        return (
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            width={size}
+            height={size}
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            className={className}
+            style={style}
+          >
+            {Array.isArray(data) && data.map(([tag, attrs], i) => {
+              const { key: _k, ...rest } = attrs || {};
+              return React.createElement(tag, { key: i, ...rest });
+            })}
+          </svg>
+        );
+      };
+    }
+
+    const GuitarIcon   = createIcon("Guitar");
+    const PlusCircle   = createIcon("PlusCircle");
+    const Settings2    = createIcon("Settings2");
+    const MenuIcon     = createIcon("Menu");
+    const XIcon        = createIcon("X");
+    const Search       = createIcon("Search");
+    const Music        = createIcon("Music");
+    const Loader2      = createIcon("Loader2");
+    const AlertCircle  = createIcon("AlertCircle");
+    const Trash2       = createIcon("Trash2");
+    const RefreshCw    = createIcon("RefreshCw");
+    const Github       = createIcon("Github");
+    const Check        = createIcon("Check");
+    const Upload       = createIcon("Upload");
+    const ClipboardPaste = createIcon("ClipboardPaste");
+    const CheckCircle2 = createIcon("CheckCircle2");
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // GitHub API helpers
+    // ─────────────────────────────────────────────────────────────────────────
+    const GH_API = "https://api.github.com";
+
+    function ghHeaders(pat) {
+      return {
+        Authorization: `Bearer ${pat}`,
+        Accept: "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "Content-Type": "application/json",
+      };
+    }
+
+    async function getFileSha(path, settings) {
+      const res = await fetch(
+        `${GH_API}/repos/${settings.owner}/${settings.repo}/contents/${path}?ref=${settings.branch}`,
+        { headers: ghHeaders(settings.pat) }
+      );
+      if (res.status === 404) return null;
+      if (!res.ok) throw new Error(`GitHub error ${res.status}: ${await res.text()}`);
+      return (await res.json()).sha;
+    }
+
+    async function uploadFile(path, base64Content, message, settings) {
+      const sha = await getFileSha(path, settings);
+      const body = { message, content: base64Content, branch: settings.branch };
+      if (sha) body.sha = sha;
+      const res = await fetch(
+        `${GH_API}/repos/${settings.owner}/${settings.repo}/contents/${path}`,
+        { method: "PUT", headers: ghHeaders(settings.pat), body: JSON.stringify(body) }
+      );
+      if (!res.ok) throw new Error(`Failed to upload ${path}: ${res.status} — ${await res.text()}`);
+    }
+
+    async function getSongData(id, settings) {
+      const res = await fetch(
+        `${GH_API}/repos/${settings.owner}/${settings.repo}/contents/songs/data/${id}.json?ref=${settings.branch}`,
+        { headers: ghHeaders(settings.pat) }
+      );
+      if (!res.ok) throw new Error(`Song not found: ${id}`);
+      const file = await res.json();
+      return JSON.parse(atob(file.content.replace(/\n/g, "")));
+    }
+
+    async function listSongs(settings) {
+      const res = await fetch(
+        `${GH_API}/repos/${settings.owner}/${settings.repo}/contents/songs/data?ref=${settings.branch}`,
+        { headers: ghHeaders(settings.pat) }
+      );
+      if (res.status === 404) return [];
+      if (!res.ok) throw new Error(`GitHub error ${res.status}: ${await res.text()}`);
+      const files = await res.json();
+      const songs = [];
+      for (const file of files) {
+        if (file.type === "file" && file.name.endsWith(".json")) {
+          const id = file.name.replace(".json", "");
+          try {
+            const data = await getSongData(id, settings);
+            songs.push({ id, title: data.title, sha: file.sha });
+          } catch {
+            songs.push({ id, title: id, sha: file.sha });
+          }
+        }
+      }
+      return songs;
+    }
+
+    async function deleteSong(id, settings) {
+      const deleteFile = async (path) => {
+        const sha = await getFileSha(path, settings);
+        if (!sha) return;
+        await fetch(
+          `${GH_API}/repos/${settings.owner}/${settings.repo}/contents/${path}`,
+          {
+            method: "DELETE",
+            headers: ghHeaders(settings.pat),
+            body: JSON.stringify({ message: `Delete song ${id}`, sha, branch: settings.branch }),
+          }
+        );
+      };
+      await deleteFile(`songs/data/${id}.json`);
+      await deleteFile(`songs/images/${id}.png`);
+    }
+
+    async function testConnection(settings) {
+      const res = await fetch(
+        `${GH_API}/repos/${settings.owner}/${settings.repo}`,
+        { headers: ghHeaders(settings.pat) }
+      );
+      if (!res.ok) throw new Error(`Cannot access repo: ${res.status}`);
+      return (await res.json()).full_name;
+    }
+
+    function songImageUrl(id, settings) {
+      return `https://raw.githubusercontent.com/${settings.owner}/${settings.repo}/${settings.branch}/songs/images/${id}.png`;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Settings helpers
+    // ─────────────────────────────────────────────────────────────────────────
+    const SETTINGS_KEY = "guitarsongs_settings";
+    const DEFAULT_SETTINGS = { pat: "", owner: "", repo: "", branch: "main" };
+
+    function loadSettings() {
+      try {
+        const raw = localStorage.getItem(SETTINGS_KEY);
+        return raw ? { ...DEFAULT_SETTINGS, ...JSON.parse(raw) } : DEFAULT_SETTINGS;
+      } catch { return DEFAULT_SETTINGS; }
+    }
+
+    function saveSettings(s) { localStorage.setItem(SETTINGS_KEY, JSON.stringify(s)); }
+    function isConfigured(s) { return !!(s.pat && s.owner && s.repo && s.branch); }
+
+    function makeId(title) {
+      const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 40);
+      return `${slug}-${Date.now().toString(36)}`;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // SettingsModal
+    // ─────────────────────────────────────────────────────────────────────────
+    function Field({ label, value, onChange, placeholder, type = "text", hint }) {
+      return (
+        <div>
+          <label
+            className="mb-1 block text-xs font-medium uppercase tracking-wider"
+            style={{ color: "var(--text-muted)" }}
+          >
+            {label}
+          </label>
+          <input
+            type={type}
+            value={value}
+            onChange={(e) => onChange(e.target.value)}
+            placeholder={placeholder}
+            className="w-full rounded-lg border px-3 py-2 text-sm outline-none focus:ring-1"
+            style={{
+              background: "var(--bg-secondary)",
+              borderColor: "var(--border)",
+              color: "var(--text-primary)",
+            }}
+          />
+          {hint && (
+            <p className="mt-1 text-xs" style={{ color: "var(--text-muted)" }}>{hint}</p>
+          )}
+        </div>
+      );
+    }
+
+    function SettingsModal({ settings, onSave, onClose }) {
+      const [form, setForm] = useState({ ...settings });
+      const [testing, setTesting] = useState(false);
+      const [testResult, setTestResult] = useState(null);
+
+      function setField(key, value) {
+        setForm((f) => ({ ...f, [key]: value }));
+        setTestResult(null);
+      }
+
+      async function handleTest() {
+        if (!form.pat || !form.owner || !form.repo) {
+          setTestResult({ ok: false, msg: "Fill in all fields first." });
+          return;
+        }
+        setTesting(true);
+        setTestResult(null);
+        try {
+          const name = await testConnection(form);
+          setTestResult({ ok: true, msg: `Connected to ${name}` });
+        } catch (e) {
+          setTestResult({ ok: false, msg: e.message });
+        } finally {
+          setTesting(false);
+        }
+      }
+
+      function handleSave() { onSave(form); onClose(); }
+
+      return (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center p-4"
+          style={{ background: "rgba(0,0,0,0.75)" }}
+        >
+          <div
+            className="w-full max-w-md rounded-xl border p-6 shadow-2xl"
+            style={{ background: "var(--bg-card)", borderColor: "var(--border)" }}
+          >
+            {/* Header */}
+            <div className="mb-5 flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Github size={20} style={{ color: "var(--accent)" }} />
+                <h2 className="text-lg font-semibold" style={{ color: "var(--text-primary)" }}>
+                  GitHub Settings
+                </h2>
+              </div>
+              <button
+                onClick={onClose}
+                className="rounded-lg p-1 transition-colors hover:bg-white/10"
+              >
+                <XIcon size={18} style={{ color: "var(--text-muted)" }} />
+              </button>
+            </div>
+
+            {/* Fields */}
+            <div className="space-y-4">
+              <Field
+                label="Personal Access Token"
+                type="password"
+                value={form.pat}
+                placeholder="ghp_xxxxxxxxxxxxxxxxxxxx"
+                onChange={(v) => setField("pat", v)}
+                hint="Needs repo read/write scope"
+              />
+              <Field
+                label="GitHub Owner"
+                value={form.owner}
+                placeholder="your-username"
+                onChange={(v) => setField("owner", v)}
+              />
+              <Field
+                label="Repository Name"
+                value={form.repo}
+                placeholder="my-guitar-songs"
+                onChange={(v) => setField("repo", v)}
+              />
+              <Field
+                label="Branch"
+                value={form.branch}
+                placeholder="main"
+                onChange={(v) => setField("branch", v)}
+              />
+            </div>
+
+            {/* Test result */}
+            {testResult && (
+              <div
+                className="mt-4 rounded-lg px-3 py-2 text-sm"
+                style={{
+                  background: testResult.ok ? "rgba(34,197,94,0.12)" : "rgba(239,68,68,0.12)",
+                  color: testResult.ok ? "#86efac" : "#fca5a5",
+                  border: `1px solid ${testResult.ok ? "rgba(34,197,94,0.25)" : "rgba(239,68,68,0.25)"}`,
+                }}
+              >
+                {testResult.msg}
+              </div>
+            )}
+
+            {/* Actions */}
+            <div className="mt-6 flex gap-2">
+              <button
+                onClick={handleTest}
+                disabled={testing}
+                className="flex items-center gap-2 rounded-lg border px-4 py-2 text-sm font-medium transition-colors hover:bg-white/5"
+                style={{ borderColor: "var(--border)", color: "var(--text-muted)" }}
+              >
+                {testing
+                  ? <Loader2 size={14} className="animate-spin" />
+                  : <Check size={14} />}
+                Test Connection
+              </button>
+              <div className="flex-1" />
+              <button
+                onClick={onClose}
+                className="rounded-lg px-4 py-2 text-sm transition-colors hover:bg-white/5"
+                style={{ color: "var(--text-muted)" }}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleSave}
+                className="rounded-lg px-4 py-2 text-sm font-semibold transition-opacity hover:opacity-80"
+                style={{ background: "var(--accent)", color: "#0f0f0f" }}
+              >
+                Save
+              </button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // SongBrowser
+    // ─────────────────────────────────────────────────────────────────────────
+    function SongBrowser({ songs, loading, error, selectedId, onSelect, onDelete, onRefresh }) {
+      const [query, setQuery] = useState("");
+      const [confirmDelete, setConfirmDelete] = useState(null);
+
+      const filtered = useMemo(
+        () => songs.filter((s) => s.title.toLowerCase().includes(query.toLowerCase())),
+        [songs, query]
+      );
+
+      function handleDelete(id, e) {
+        e.stopPropagation();
+        if (confirmDelete === id) {
+          onDelete(id);
+          setConfirmDelete(null);
+        } else {
+          setConfirmDelete(id);
+          setTimeout(() => setConfirmDelete(null), 3000);
+        }
+      }
+
+      return (
+        <div className="flex h-full flex-col">
+          {/* Search bar */}
+          <div className="p-3">
+            <div
+              className="flex items-center gap-2 rounded-lg border px-3 py-2"
+              style={{ background: "var(--bg-secondary)", borderColor: "var(--border)" }}
+            >
+              <Search size={14} style={{ color: "var(--text-muted)" }} />
+              <input
+                type="text"
+                placeholder="Search songs..."
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                className="flex-1 bg-transparent text-sm outline-none"
+                style={{ color: "var(--text-primary)" }}
+              />
+            </div>
+          </div>
+
+          {/* Count + refresh */}
+          <div
+            className="flex items-center justify-between border-b px-3 pb-2"
+            style={{ borderColor: "var(--border)" }}
+          >
+            <span className="text-xs" style={{ color: "var(--text-muted)" }}>
+              {loading ? "Loading…" : `${filtered.length} song${filtered.length !== 1 ? "s" : ""}`}
+            </span>
+            <button
+              onClick={onRefresh}
+              disabled={loading}
+              className="rounded p-1 transition-colors hover:bg-white/10"
+              title="Refresh"
+            >
+              <RefreshCw
+                size={13}
+                style={{ color: "var(--text-muted)" }}
+                className={loading ? "animate-spin" : ""}
+              />
+            </button>
+          </div>
+
+          {/* Song list */}
+          <div className="flex-1 overflow-y-auto">
+            {loading && (
+              <div className="flex items-center justify-center gap-2 py-12">
+                <Loader2 size={18} className="animate-spin" style={{ color: "var(--accent)" }} />
+                <span className="text-sm" style={{ color: "var(--text-muted)" }}>Fetching songs…</span>
+              </div>
+            )}
+
+            {!loading && error && (
+              <div className="p-4">
+                <div
+                  className="flex items-start gap-2 rounded-lg p-3 text-sm"
+                  style={{
+                    background: "rgba(239,68,68,0.1)",
+                    color: "#fca5a5",
+                    border: "1px solid rgba(239,68,68,0.2)",
+                  }}
+                >
+                  <AlertCircle size={14} className="mt-0.5 shrink-0" />
+                  <span>{error}</span>
+                </div>
+              </div>
+            )}
+
+            {!loading && !error && filtered.length === 0 && (
+              <div className="flex flex-col items-center justify-center gap-2 py-16">
+                <Music size={32} style={{ color: "var(--border)" }} />
+                <p className="text-sm" style={{ color: "var(--text-muted)" }}>
+                  {songs.length === 0 ? "No songs yet" : "No results"}
+                </p>
+              </div>
+            )}
+
+            {!loading && filtered.map((song) => (
+              <button
+                key={song.id}
+                onClick={() => onSelect(song.id)}
+                className="group flex w-full items-center gap-3 px-3 py-3 text-left transition-colors"
+                style={{
+                  background: selectedId === song.id ? "rgba(201,168,76,0.12)" : "transparent",
+                  borderLeft: selectedId === song.id ? "2px solid var(--accent)" : "2px solid transparent",
+                }}
+              >
+                <Music
+                  size={14}
+                  className="shrink-0"
+                  style={{ color: selectedId === song.id ? "var(--accent)" : "var(--text-muted)" }}
+                />
+                <span
+                  className="flex-1 truncate text-sm font-medium"
+                  style={{ color: selectedId === song.id ? "var(--accent)" : "var(--text-primary)" }}
+                >
+                  {song.title}
+                </span>
+                <button
+                  onClick={(e) => handleDelete(song.id, e)}
+                  className="shrink-0 rounded p-1 opacity-0 transition-all group-hover:opacity-100"
+                  style={{
+                    color: confirmDelete === song.id ? "#ef4444" : "var(--text-muted)",
+                    background: confirmDelete === song.id ? "rgba(239,68,68,0.15)" : "transparent",
+                  }}
+                  title={confirmDelete === song.id ? "Click again to confirm delete" : "Delete song"}
+                >
+                  <Trash2 size={12} />
+                </button>
+              </button>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // SongDisplay
+    // ─────────────────────────────────────────────────────────────────────────
+    function SongDisplay({ song, imgUrl, loading, error }) {
+      if (loading) {
+        return (
+          <div className="flex h-full items-center justify-center gap-3">
+            <Loader2 size={22} className="animate-spin" style={{ color: "var(--accent)" }} />
+            <span style={{ color: "var(--text-muted)" }}>Loading song…</span>
+          </div>
+        );
+      }
+
+      if (error) {
+        return (
+          <div className="flex h-full items-center justify-center p-8">
+            <div
+              className="flex max-w-sm items-start gap-3 rounded-xl p-4 text-sm"
+              style={{
+                background: "rgba(239,68,68,0.1)",
+                color: "#fca5a5",
+                border: "1px solid rgba(239,68,68,0.2)",
+              }}
+            >
+              <AlertCircle size={16} className="mt-0.5 shrink-0" />
+              <span>{error}</span>
+            </div>
+          </div>
+        );
+      }
+
+      if (!song) {
+        return (
+          <div className="flex h-full flex-col items-center justify-center gap-4 p-8">
+            <div className="rounded-full p-6" style={{ background: "rgba(201,168,76,0.06)" }}>
+              <Music size={48} style={{ color: "var(--border)" }} />
+            </div>
+            <div className="text-center">
+              <p className="text-lg font-semibold" style={{ color: "var(--text-muted)" }}>
+                Select a song
+              </p>
+              <p className="mt-1 text-sm" style={{ color: "var(--text-muted)" }}>
+                Choose from the sidebar, or add a new one.
+              </p>
+            </div>
+          </div>
+        );
+      }
+
+      return (
+        <div className="flex h-full flex-col overflow-y-auto">
+          <div className="border-b px-6 py-5" style={{ borderColor: "var(--border)" }}>
+            <h1
+              className="text-2xl font-bold tracking-tight"
+              style={{ color: "var(--text-primary)" }}
+            >
+              {song.title}
+            </h1>
+            {song.createdAt && (
+              <p className="mt-1 text-xs" style={{ color: "var(--text-muted)" }}>
+                Added{" "}
+                {new Date(song.createdAt).toLocaleDateString("en-US", {
+                  year: "numeric", month: "long", day: "numeric",
+                })}
+              </p>
+            )}
+          </div>
+
+          <div className="flex-1 space-y-6 p-6">
+            {song.hasImage && imgUrl && (
+              <div>
+                <p
+                  className="mb-2 text-xs font-medium uppercase tracking-wider"
+                  style={{ color: "var(--text-muted)" }}
+                >
+                  Tab Image
+                </p>
+                <div
+                  className="overflow-hidden rounded-xl border"
+                  style={{ background: "var(--bg-secondary)", borderColor: "var(--border)" }}
+                >
+                  <img
+                    src={imgUrl}
+                    alt={`Tab for ${song.title}`}
+                    className="max-h-[60vh] w-full object-contain"
+                    onError={(e) => {
+                      e.target.style.display = "none";
+                      const p = e.target.parentElement;
+                      if (p) p.innerHTML = `<div style="display:flex;align-items:center;justify-content:center;padding:48px;color:var(--text-muted);font-size:14px;">Image not yet available — it may take a moment to appear on GitHub.</div>`;
+                    }}
+                  />
+                </div>
+              </div>
+            )}
+
+            {song.lyrics && (
+              <div>
+                <p
+                  className="mb-2 text-xs font-medium uppercase tracking-wider"
+                  style={{ color: "var(--text-muted)" }}
+                >
+                  Lyrics / Tabs
+                </p>
+                <div
+                  className="rounded-xl border p-4"
+                  style={{ background: "var(--bg-secondary)", borderColor: "var(--border)" }}
+                >
+                  <pre
+                    className="tab-text text-sm leading-relaxed"
+                    style={{ color: "var(--text-primary)" }}
+                  >
+                    {song.lyrics}
+                  </pre>
+                </div>
+              </div>
+            )}
+
+            {!song.hasImage && !song.lyrics && (
+              <div className="text-center text-sm" style={{ color: "var(--text-muted)" }}>
+                This song has no content yet.
+              </div>
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // SongForm
+    // ─────────────────────────────────────────────────────────────────────────
+    function SongForm({ onSubmit }) {
+      const [title, setTitle]           = useState("");
+      const [lyrics, setLyrics]         = useState("");
+      const [imageBase64, setImageBase64] = useState(null);
+      const [imagePreview, setImagePreview] = useState(null);
+      const [pasteHover, setPasteHover] = useState(false);
+      const [submitting, setSubmitting] = useState(false);
+      const [success, setSuccess]       = useState(false);
+      const [error, setError]           = useState(null);
+      const pasteAreaRef = useRef(null);
+
+      const processImageFile = useCallback((file) => {
+        const reader = new FileReader();
+        reader.onload = (ev) => {
+          const dataUrl = ev.target.result;
+          setImagePreview(dataUrl);
+          setImageBase64(dataUrl.split(",")[1]);
+        };
+        reader.readAsDataURL(file);
+      }, []);
+
+      const handlePaste = useCallback((e) => {
+        const items = e.clipboardData?.items;
+        if (!items) return;
+        for (const item of Array.from(items)) {
+          if (item.type.startsWith("image/")) {
+            const file = item.getAsFile();
+            if (file) { processImageFile(file); return; }
+          }
+        }
+      }, [processImageFile]);
+
+      const handleGlobalPaste = useCallback((e) => {
+        const items = e.clipboardData?.items;
+        if (!items) return;
+        for (const item of Array.from(items)) {
+          if (item.type.startsWith("image/")) {
+            const file = item.getAsFile();
+            if (file) { processImageFile(file); return; }
+          }
+        }
+      }, [processImageFile]);
+
+      function focusPasteArea() {
+        pasteAreaRef.current?.focus();
+        document.addEventListener("paste", handleGlobalPaste, { once: true });
+      }
+
+      function handleDrop(e) {
+        e.preventDefault();
+        setPasteHover(false);
+        const file = e.dataTransfer.files[0];
+        if (file?.type.startsWith("image/")) processImageFile(file);
+      }
+
+      function clearImage() { setImageBase64(null); setImagePreview(null); }
+
+      async function handleSubmit(e) {
+        e.preventDefault();
+        if (!title.trim()) { setError("Song title is required."); return; }
+        setError(null);
+        setSubmitting(true);
+        try {
+          await onSubmit({ title: title.trim(), imageBase64, lyrics });
+          setSuccess(true);
+          setTitle(""); setLyrics(""); setImageBase64(null); setImagePreview(null);
+          setTimeout(() => setSuccess(false), 3000);
+        } catch (err) {
+          setError(err.message);
+        } finally {
+          setSubmitting(false);
+        }
+      }
+
+      return (
+        <form onSubmit={handleSubmit} className="flex h-full flex-col gap-5 p-6">
+          <div>
+            <h2 className="mb-1 text-xl font-bold" style={{ color: "var(--text-primary)" }}>
+              Add New Song
+            </h2>
+            <p className="text-sm" style={{ color: "var(--text-muted)" }}>
+              Paste a tab image and enter your lyrics or ASCII tabs below.
+            </p>
+          </div>
+
+          {/* Title */}
+          <div>
+            <label
+              className="mb-1.5 block text-xs font-medium uppercase tracking-wider"
+              style={{ color: "var(--text-muted)" }}
+            >
+              Song Title *
+            </label>
+            <input
+              type="text"
+              value={title}
+              onChange={(e) => setTitle(e.target.value)}
+              placeholder="e.g. Wish You Were Here"
+              className="w-full rounded-lg border px-4 py-2.5 text-base outline-none focus:ring-1"
+              style={{
+                background: "var(--bg-secondary)",
+                borderColor: "var(--border)",
+                color: "var(--text-primary)",
+              }}
+            />
+          </div>
+
+          {/* Image paste area */}
+          <div>
+            <label
+              className="mb-1.5 block text-xs font-medium uppercase tracking-wider"
+              style={{ color: "var(--text-muted)" }}
+            >
+              Tab Image (Optional)
+            </label>
+
+            {imagePreview ? (
+              <div className="relative">
+                <img
+                  src={imagePreview}
+                  alt="Tab preview"
+                  className="max-h-56 w-full rounded-lg border object-contain"
+                  style={{ background: "var(--bg-secondary)", borderColor: "var(--border)" }}
+                />
+                <button
+                  type="button"
+                  onClick={clearImage}
+                  className="absolute right-2 top-2 rounded-full p-1 transition-colors hover:bg-white/20"
+                  style={{ background: "rgba(0,0,0,0.6)" }}
+                >
+                  <XIcon size={14} style={{ color: "var(--text-primary)" }} />
+                </button>
+              </div>
+            ) : (
+              <div
+                ref={pasteAreaRef}
+                tabIndex={0}
+                onPaste={handlePaste}
+                onClick={focusPasteArea}
+                onDrop={handleDrop}
+                onDragOver={(e) => { e.preventDefault(); setPasteHover(true); }}
+                onDragLeave={() => setPasteHover(false)}
+                className="flex cursor-pointer flex-col items-center justify-center gap-3 rounded-lg border-2 border-dashed py-10 transition-colors"
+                style={{
+                  borderColor: pasteHover ? "var(--accent)" : "var(--border)",
+                  background: pasteHover ? "rgba(201,168,76,0.06)" : "var(--bg-secondary)",
+                }}
+              >
+                <div className="rounded-full p-3" style={{ background: "rgba(201,168,76,0.1)" }}>
+                  <ClipboardPaste size={22} style={{ color: "var(--accent)" }} />
+                </div>
+                <div className="text-center">
+                  <p className="text-sm font-medium" style={{ color: "var(--text-primary)" }}>
+                    Paste or drop a tab image here
+                  </p>
+                  <p className="mt-0.5 text-xs" style={{ color: "var(--text-muted)" }}>
+                    Click to focus, then Ctrl+V — or drag &amp; drop
+                  </p>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Lyrics / ASCII Tabs */}
+          <div className="flex flex-1 flex-col">
+            <label
+              className="mb-1.5 block text-xs font-medium uppercase tracking-wider"
+              style={{ color: "var(--text-muted)" }}
+            >
+              Lyrics / ASCII Tabs
+            </label>
+            <textarea
+              value={lyrics}
+              onChange={(e) => setLyrics(e.target.value)}
+              placeholder={"e|-----------0---|\nB|-------1-------|\nG|---0-----------|\nD|---------------|\n\nVerse 1:\n..."}
+              className="tab-text flex-1 resize-none rounded-lg border px-4 py-3 text-sm outline-none focus:ring-1"
+              style={{
+                background: "var(--bg-secondary)",
+                borderColor: "var(--border)",
+                color: "var(--text-primary)",
+                minHeight: "180px",
+              }}
+            />
+          </div>
+
+          {/* Error */}
+          {error && (
+            <div
+              className="rounded-lg px-4 py-2.5 text-sm"
+              style={{
+                background: "rgba(239,68,68,0.1)",
+                color: "#fca5a5",
+                border: "1px solid rgba(239,68,68,0.2)",
+              }}
+            >
+              {error}
+            </div>
+          )}
+
+          {/* Submit */}
+          <button
+            type="submit"
+            disabled={submitting}
+            className="flex items-center justify-center gap-2 rounded-lg py-3 text-sm font-semibold transition-opacity hover:opacity-80 disabled:opacity-50"
+            style={{ background: "var(--accent)", color: "#0f0f0f" }}
+          >
+            {submitting ? (
+              <><Loader2 size={16} className="animate-spin" /> Saving to GitHub…</>
+            ) : success ? (
+              <><CheckCircle2 size={16} /> Saved!</>
+            ) : (
+              <><Upload size={16} /> Save Song to GitHub</>
+            )}
+          </button>
+        </form>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // App (main)
+    // ─────────────────────────────────────────────────────────────────────────
+    function App() {
+      const [settings, setSettings]       = useState(DEFAULT_SETTINGS);
+      const [showSettings, setShowSettings] = useState(false);
+      const [sidebarOpen, setSidebarOpen] = useState(true);
+      const [view, setView]               = useState("browse");
+
+      const [songs, setSongs]             = useState([]);
+      const [songsLoading, setSongsLoading] = useState(false);
+      const [songsError, setSongsError]   = useState(null);
+
+      const [selectedId, setSelectedId]   = useState(null);
+      const [currentSong, setCurrentSong] = useState(null);
+      const [songLoading, setSongLoading] = useState(false);
+      const [songError, setSongError]     = useState(null);
+
+      // Load settings on mount
+      useEffect(() => {
+        const s = loadSettings();
+        setSettings(s);
+        if (!isConfigured(s)) setShowSettings(true);
+      }, []);
+
+      const fetchSongs = useCallback(async (s) => {
+        if (!isConfigured(s)) return;
+        setSongsLoading(true);
+        setSongsError(null);
+        try {
+          const list = await listSongs(s);
+          setSongs(list.sort((a, b) => a.title.localeCompare(b.title)));
+        } catch (err) {
+          setSongsError(err.message);
+        } finally {
+          setSongsLoading(false);
+        }
+      }, []);
+
+      useEffect(() => {
+        if (isConfigured(settings)) fetchSongs(settings);
+      }, [settings, fetchSongs]);
+
+      function handleSaveSettings(s) {
+        saveSettings(s);
+        setSettings(s);
+        setSongs([]);
+        setSelectedId(null);
+        setCurrentSong(null);
+      }
+
+      async function handleSelectSong(id) {
+        setSelectedId(id);
+        setView("browse");
+        setSongLoading(true);
+        setSongError(null);
+        setCurrentSong(null);
+        try {
+          const data = await getSongData(id, settings);
+          setCurrentSong(data);
+        } catch (err) {
+          setSongError(err.message);
+        } finally {
+          setSongLoading(false);
+        }
+      }
+
+      async function handleDeleteSong(id) {
+        try {
+          await deleteSong(id, settings);
+          setSongs((prev) => prev.filter((s) => s.id !== id));
+          if (selectedId === id) { setSelectedId(null); setCurrentSong(null); }
+        } catch (err) {
+          alert(`Delete failed: ${err.message}`);
+        }
+      }
+
+      async function handleAddSong({ title, imageBase64, lyrics }) {
+        if (!isConfigured(settings)) throw new Error("Configure GitHub settings first.");
+        const id = makeId(title);
+        const songData = {
+          id, title, lyrics,
+          hasImage: !!imageBase64,
+          createdAt: new Date().toISOString(),
+        };
+        const jsonBase64 = btoa(unescape(encodeURIComponent(JSON.stringify(songData, null, 2))));
+        await uploadFile(`songs/data/${id}.json`, jsonBase64, `Add song: ${title}`, settings);
+        if (imageBase64) {
+          await uploadFile(`songs/images/${id}.png`, imageBase64, `Add tab image for: ${title}`, settings);
+        }
+        await fetchSongs(settings);
+        await handleSelectSong(id);
+        setView("browse");
+      }
+
+      const configured = isConfigured(settings);
+      const currentImgUrl = selectedId && currentSong?.hasImage
+        ? songImageUrl(selectedId, settings)
+        : null;
+
+      return (
+        <div className="flex h-screen flex-col overflow-hidden">
+          {/* ── Top Bar ── */}
+          <header
+            className="flex shrink-0 items-center gap-3 border-b px-4 py-3"
+            style={{ background: "var(--bg-secondary)", borderColor: "var(--border)" }}
+          >
+            {/* Mobile sidebar toggle */}
+            <button
+              onClick={() => setSidebarOpen((o) => !o)}
+              className="rounded-lg p-1.5 transition-colors hover:bg-white/10 lg:hidden"
+            >
+              {sidebarOpen
+                ? <XIcon size={18} style={{ color: "var(--text-muted)" }} />
+                : <MenuIcon size={18} style={{ color: "var(--text-muted)" }} />}
+            </button>
+
+            {/* Logo */}
+            <div className="flex items-center gap-2">
+              <GuitarIcon size={22} style={{ color: "var(--accent)" }} />
+              <span
+                className="text-base font-bold tracking-tight"
+                style={{ color: "var(--text-primary)" }}
+              >
+                Guitar Songs
+              </span>
+            </div>
+
+            <div className="flex-1" />
+
+            {/* Add Song */}
+            <button
+              onClick={() => { setView("add"); setSidebarOpen(false); }}
+              className="flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-sm font-medium transition-opacity hover:opacity-80"
+              style={{ background: "var(--accent)", color: "#0f0f0f" }}
+            >
+              <PlusCircle size={14} />
+              <span className="hidden sm:inline">Add Song</span>
+            </button>
+
+            {/* Settings */}
+            <button
+              onClick={() => setShowSettings(true)}
+              className="relative rounded-lg p-1.5 transition-colors hover:bg-white/10"
+              title="GitHub Settings"
+            >
+              <Settings2 size={18} style={{ color: "var(--text-muted)" }} />
+              {!configured && (
+                <span
+                  className="absolute right-1 top-1 h-2 w-2 rounded-full"
+                  style={{ background: "#ef4444" }}
+                />
+              )}
+            </button>
+          </header>
+
+          {/* ── Body ── */}
+          <div className="flex flex-1 overflow-hidden">
+            {/* ── Sidebar ── */}
+            <aside
+              className={`flex flex-col border-r transition-all duration-200 overflow-hidden shrink-0 ${sidebarOpen ? "w-64 lg:w-72" : "w-0"}`}
+              style={{ background: "var(--bg-secondary)", borderColor: "var(--border)" }}
+            >
+              <div className="border-b p-3" style={{ borderColor: "var(--border)" }}>
+                <button
+                  onClick={() => { setView("add"); setSidebarOpen(false); }}
+                  className="flex w-full items-center justify-center gap-2 rounded-lg border py-2 text-sm font-medium transition-colors hover:bg-white/5"
+                  style={{ borderColor: "var(--border)", color: "var(--accent)" }}
+                >
+                  <PlusCircle size={14} />
+                  Add New Song
+                </button>
+              </div>
+
+              {configured ? (
+                <SongBrowser
+                  songs={songs}
+                  loading={songsLoading}
+                  error={songsError}
+                  selectedId={selectedId}
+                  onSelect={(id) => {
+                    handleSelectSong(id);
+                    if (window.innerWidth < 1024) setSidebarOpen(false);
+                  }}
+                  onDelete={handleDeleteSong}
+                  onRefresh={() => fetchSongs(settings)}
+                />
+              ) : (
+                <div className="flex flex-col items-center justify-center gap-3 p-6 text-center">
+                  <p className="text-sm" style={{ color: "var(--text-muted)" }}>
+                    Configure GitHub settings to browse and save songs.
+                  </p>
+                  <button
+                    onClick={() => setShowSettings(true)}
+                    className="text-sm underline"
+                    style={{ color: "var(--accent)" }}
+                  >
+                    Open Settings
+                  </button>
+                </div>
+              )}
+            </aside>
+
+            {/* ── Main Content ── */}
+            <main className="flex flex-1 flex-col overflow-hidden">
+              {view === "add" ? (
+                <div className="flex h-full flex-col overflow-y-auto">
+                  <div
+                    className="flex shrink-0 items-center gap-2 border-b px-4 py-2"
+                    style={{ borderColor: "var(--border)" }}
+                  >
+                    <button
+                      onClick={() => setView("browse")}
+                      className="text-xs underline"
+                      style={{ color: "var(--text-muted)" }}
+                    >
+                      ← Back to browser
+                    </button>
+                  </div>
+                  <SongForm onSubmit={handleAddSong} />
+                </div>
+              ) : (
+                <SongDisplay
+                  song={currentSong}
+                  imgUrl={currentImgUrl}
+                  loading={songLoading}
+                  error={songError}
+                />
+              )}
+            </main>
+          </div>
+
+          {/* ── Settings Modal ── */}
+          {showSettings && (
+            <SettingsModal
+              settings={settings}
+              onSave={handleSaveSettings}
+              onClose={() => setShowSettings(false)}
+            />
+          )}
+        </div>
+      );
+    }
+
+    // Mount
+    const root = ReactDOM.createRoot(document.getElementById("root"));
+    root.render(<App />);
+  </script>
+</body>
+</html>
